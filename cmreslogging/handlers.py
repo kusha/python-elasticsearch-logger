@@ -417,7 +417,7 @@ class NonBlockingCMRESHandler(CMRESHandler):
         for process in self.bulk_send_processes:
             if process.is_alive():
                 process.join()  # blocking w/o timeout
-        super(CustomCMRESHandler, self).close()
+        super(NonBlockingCMRESHandler, self).close()
 
     def refresh_forked_handler(self):
         """Wipe shared threading resources after fork."""
