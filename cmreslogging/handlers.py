@@ -4,7 +4,10 @@
 import logging
 import datetime
 import socket
+import os
+import time
 from threading import Timer, Lock
+from multiprocessing import Process
 from enum import Enum
 from elasticsearch import helpers as eshelpers
 from elasticsearch import Elasticsearch, RequestsHttpConnection
@@ -356,3 +359,113 @@ class CMRESHandler(logging.Handler):
             self.flush()
         else:
             self.__schedule_flush()
+
+
+class NonBlockingCMRESHandler(CMRESHandler):
+    """
+    CMRESHandler multiprocessing implementation.
+    Each bulk send is performed in a new process.
+    Fork safe, thread safe.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Overridde constructor creates threads list."""
+        super(NonBlockingCMRESHandler, self).__init__(*args, **kwargs)
+        self.bulk_send_processes = []
+        self.original_pid = os.getpid()  # on handler init
+
+    def flush(self):
+        """Call eshelpers.bulk() in a new thread."""
+        # if flush() will be called first after a fork,
+        # self.bulk_send_processes may contain non-child process
+        # it is required to try refresh_forked_handler()
+        self.refresh_forked_handler()
+        if self._timer is not None and self._timer.is_alive():
+            self._timer.cancel()
+        self._timer = None
+        # join and delete dead bulk_send processes
+        alive_processes = []
+        for process in self.bulk_send_processes:
+            if not process.is_alive():
+                process.join()  # blocking w/o timeout
+            else:
+                alive_processes.append(process)
+        self.bulk_send_processes = alive_processes
+        if self._buffer:
+            try:
+                with self._buffer_lock:
+                    logs_buffer = self._buffer
+                    self._buffer = []
+                actions = (
+                    {
+                        '_index':
+                            self._index_name_func.__func__(self.es_index_name),
+                        '_type': self.es_doc_type,
+                        '_source': log_record
+                    }
+                    for log_record in logs_buffer
+                )
+                # call bulk send in a new process
+                bulk_send_process = Process(
+                    target=eshelpers.bulk,
+                    kwargs={
+                        # name mangling is used in get_es_client()
+                        'client': self._CMRESHandler__get_es_client(),
+                        'actions': actions,
+                        'stats_only': True
+                    }
+                )
+                bulk_send_process.name = \
+                    "ES Logging {} @ {}".format(os.getpid(), time.time())
+                bulk_send_process.start()
+                # save reference to the child process
+                self.bulk_send_processes.append(bulk_send_process)
+            except Exception as exception:
+                if self.raise_on_indexing_exceptions:
+                    raise exception
+
+    def close(self):
+        """Wait for exisiting bulk_send process(es) before close."""
+        for process in self.bulk_send_processes:
+            if process.is_alive():
+                process.join()  # blocking w/o timeout
+        super(NonBlockingCMRESHandler, self).close()
+
+    def refresh_forked_handler(self):
+        """Wipe shared threading resources after fork."""
+        current_pid = os.getpid()
+        if self.original_pid != current_pid:  # is forked
+            # check threading lock, release if needed
+            if self._buffer_lock.locked():
+                self._buffer_lock.release()
+            # wipe buffer, the content will be send by a parent process
+            with self._buffer_lock:
+                self._buffer = []
+            # wipe sending timer (refrence to the thread)
+            self._timer = None
+            # wipe child processes list
+            self.bulk_send_processes = []
+            # update PID
+            self.original_pid = current_pid
+
+    def emit(self, record):
+        """
+        Override emit function to add fork check.
+         Some parent class methods using name mangling.
+        """
+        self.refresh_forked_handler()
+        self.format(record)
+        rec = self.es_additional_fields.copy()
+        for key, value in record.__dict__.items():
+            if key not in CMRESHandler._CMRESHandler__LOGGING_FILTER_FIELDS:
+                if key == "args":
+                    value = tuple(str(arg) for arg in value)
+                rec[key] = "" if value is None else value
+        rec[self.default_timestamp_field_name] = \
+            self._CMRESHandler__get_es_datetime_str(record.created)
+        with self._buffer_lock:
+            self._buffer.append(rec)
+        if len(self._buffer) >= self.buffer_size:
+            self.flush()
+        else:
+            self._CMRESHandler__schedule_flush()
